@@ -1,0 +1,236 @@
+#!/bin/bash
+
+# omarchy:summary=List, rename, and enable/disable PipeWire audio input/output devices
+# omarchy:args=<list|set-name|set-disabled|reset> [node-name] [kind] [value]
+# omarchy:hidden=true
+
+set -euo pipefail
+
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy"
+OVERRIDES_FILE="$STATE_DIR/audio-device-overrides.json"
+KNOWN_FILE="$STATE_DIR/audio-device-known.json"
+CONF_FILE="$HOME/.config/wireplumber/wireplumber.conf.d/90-omarchy-audio-device-manager.conf"
+
+mkdir -p "$STATE_DIR" "$(dirname "$CONF_FILE")"
+[[ -f $OVERRIDES_FILE ]] || echo '{}' >"$OVERRIDES_FILE"
+[[ -f $KNOWN_FILE ]] || echo '{}' >"$KNOWN_FILE"
+
+usage() {
+  echo "Usage: omarchy-audio-device-manager <list|set-name|set-disabled|reset> [node-name] [kind] [value]" >&2
+  exit 1
+}
+
+# SPA-json string escaping (backslash then double-quote), same approach used
+# by omarchy-toggle-input-device for Lua strings.
+sp_escape() {
+  local s=$1
+  s=${s//\\/\\\\}
+  s=${s//\"/\\\"}
+  printf '%s' "$s"
+}
+
+live_devices_json() {
+  # pw-dump (not `pactl -f json`) because pactl's JSON formatter mangles
+  # multi-byte UTF-8 in node names/descriptions (e.g. accented "Saída"),
+  # silently nulling the field. pw-dump comes straight from PipeWire core
+  # and round-trips UTF-8 correctly.
+  # Some ALSA "extra" HDMI ports report node.description/node.nick as a bare
+  # boolean instead of a string (seen on unplugged hdmi-stereo-extra* ports),
+  # which poisons every downstream jq that assumes a string (ascii_downcase,
+  # cache writes). Only trust props that are actually strings.
+  timeout 3 pw-dump 2>/dev/null | jq '
+    [.[] | select(.info.props["media.class"]? == "Audio/Sink" or .info.props["media.class"]? == "Audio/Source")
+       | {
+           node_name: .info.props["node.name"],
+           kind: (if .info.props["media.class"] == "Audio/Sink" then "sink" else "source" end),
+           description: (
+             (.info.props["node.description"] | select(type == "string"))
+             // (.info.props["node.nick"] | select(type == "string"))
+             // .info.props["node.name"]
+           )
+         }]
+    | map(select((.node_name // "") | endswith(".monitor") | not))
+    | map(select(.node_name != null))
+  ' || echo '[]'
+}
+
+update_known_cache() {
+  local live="$1"
+  local next
+  next=$(jq -n --argjson live "$live" --slurpfile known "$KNOWN_FILE" '
+    ($known[0] // {}) as $prev
+    | reduce $live[] as $d ($prev;
+        .[$d.node_name] = {original_description: $d.description, kind: $d.kind}
+      )
+  ')
+  printf '%s\n' "$next" >"$KNOWN_FILE"
+}
+
+cmd_list() {
+  local live known overrides
+  live=$(live_devices_json)
+  update_known_cache "$live"
+  known=$(cat "$KNOWN_FILE")
+  overrides=$(cat "$OVERRIDES_FILE")
+
+  jq -n --argjson live "$live" --argjson known "$known" --argjson overrides "$overrides" '
+    ($live | map(.node_name)) as $liveNames
+    | (($overrides | keys) + ($known | keys) + $liveNames | unique) as $allNames
+    | [ $allNames[] as $name
+        | ($live | map(select(.node_name == $name)) | .[0]) as $liveEntry
+        | ($overrides[$name] // {}) as $ov
+        | ($known[$name] // {}) as $kn
+        | {
+            node_name: $name,
+            kind: ($ov.kind // $liveEntry.kind // $kn.kind // "sink"),
+            live: ($liveEntry != null),
+            disabled: ($ov.disabled // false),
+            custom_name: ($ov.name // null),
+            original_name: ($kn.original_description // $liveEntry.description // $name),
+          }
+        | .display_name = ($ov.name // .original_name)
+        # Unplugged devices with no override are just stale cache entries
+        # (e.g. an HDMI port the TV used to be on); hide them.
+        | select(.live or ($overrides | has($name)))
+      ]
+    | sort_by([.kind, (.display_name | ascii_downcase)])
+  '
+}
+
+regenerate_conf() {
+  local overrides
+  overrides=$(cat "$OVERRIDES_FILE")
+
+  local alsa_body="" bluez_body=""
+
+  # Unit separator, not tab: tab is IFS whitespace, so `read` would collapse
+  # an empty custom_name and shift "true" from the disabled field into it.
+  while IFS=$'\x1f' read -r name custom_name disabled; do
+    [[ -z $name ]] && continue
+    local props=""
+    if [[ -n $custom_name ]]; then
+      local esc
+      esc=$(sp_escape "$custom_name")
+      props+=$'        node.description = "'"$esc"$'"\n'
+      props+=$'        node.nick = "'"$esc"$'"\n'
+    fi
+    if [[ $disabled == "true" ]]; then
+      props+=$'        node.disabled = true\n'
+    fi
+    [[ -z $props ]] && continue
+
+    local esc_name
+    esc_name=$(sp_escape "$name")
+    local block
+    block=$(cat <<BLOCK
+  {
+    matches = [
+      {
+        node.name = "$esc_name"
+      }
+    ]
+    actions = {
+      update-props = {
+$props      }
+    }
+  }
+BLOCK
+)
+    if [[ $name == bluez_* ]]; then
+      bluez_body+="$block"$'\n'
+    else
+      alsa_body+="$block"$'\n'
+    fi
+  done < <(jq -r '
+    to_entries[]
+    | [.key, (.value.name // ""), ((.value.disabled // false) | tostring)]
+    | join("\u001f")
+  ' <<<"$overrides")
+
+  {
+    echo "# Managed by omarchy-audio-device-manager — do not edit by hand."
+    echo "# Renames and enable/disable overrides for audio input/output devices."
+    echo
+    echo "monitor.alsa.rules = ["
+    printf '%s' "$alsa_body"
+    echo "]"
+    if [[ -n $bluez_body ]]; then
+      echo
+      echo "monitor.bluez.rules = ["
+      printf '%s' "$bluez_body"
+      echo "]"
+    fi
+  } >"$CONF_FILE"
+}
+
+apply_and_reload() {
+  regenerate_conf
+  systemctl --user restart wireplumber.service
+  sleep 1.5
+}
+
+cmd_set_name() {
+  local node_name=$1 kind=$2 name=$3
+  local next
+  if [[ -z $name ]]; then
+    next=$(jq --arg n "$node_name" '
+      if (.[$n] // {}) | (has("disabled") and .disabled == true)
+      then .[$n].name = null
+      else del(.[$n].name) | if (.[$n] // {}) == {} then del(.[$n]) else . end
+      end
+    ' "$OVERRIDES_FILE")
+  else
+    next=$(jq --arg n "$node_name" --arg k "$kind" --arg name "$name" '
+      .[$n] = ((.[$n] // {}) + {kind: $k, name: $name})
+    ' "$OVERRIDES_FILE")
+  fi
+  printf '%s\n' "$next" >"$OVERRIDES_FILE"
+  apply_and_reload
+  cmd_list
+}
+
+cmd_set_disabled() {
+  local node_name=$1 kind=$2 value=$3
+  local next
+  next=$(jq --arg n "$node_name" --arg k "$kind" --argjson d "$value" '
+    .[$n] = ((.[$n] // {}) + {kind: $k, disabled: $d})
+    | if (.[$n].disabled == false) and ((.[$n].name // "") == "")
+      then del(.[$n])
+      else .
+      end
+  ' "$OVERRIDES_FILE")
+  printf '%s\n' "$next" >"$OVERRIDES_FILE"
+  apply_and_reload
+  cmd_list
+}
+
+cmd_reset() {
+  local node_name=$1
+  local next
+  next=$(jq --arg n "$node_name" 'del(.[$n])' "$OVERRIDES_FILE")
+  printf '%s\n' "$next" >"$OVERRIDES_FILE"
+  apply_and_reload
+  cmd_list
+}
+
+action=${1:-}
+case "$action" in
+  list)
+    cmd_list
+    ;;
+  set-name)
+    [[ $# -eq 4 ]] || usage
+    cmd_set_name "$2" "$3" "$4"
+    ;;
+  set-disabled)
+    [[ $# -eq 4 && ($4 == "true" || $4 == "false") ]] || usage
+    cmd_set_disabled "$2" "$3" "$4"
+    ;;
+  reset)
+    [[ $# -eq 2 ]] || usage
+    cmd_reset "$2"
+    ;;
+  *)
+    usage
+    ;;
+esac
